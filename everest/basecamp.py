@@ -15,7 +15,7 @@ from .utils import InitLog, Formatter, AP_SATURATED_PIXEL, AP_COLLAPSED_PIXEL
 from .math import Chunks, Scatter, SavGol, Interpolate
 from .gp import GetCovariance
 from .search import Search
-from .transit import TransitModel
+from .transit import TransitModel, TransitShape
 from scipy.linalg import block_diag
 import os, sys
 import numpy as np
@@ -26,6 +26,11 @@ from matplotlib.ticker import MaxNLocator, FuncFormatter
 from scipy.ndimage import zoom
 from itertools import combinations_with_replacement as multichoose
 import traceback
+try:
+  from tqdm import tqdm
+  prange = lambda x: tqdm(range(x))
+except ImportError:
+  prange = lambda x: range(x)
 import logging
 log = logging.getLogger(__name__)
 
@@ -363,7 +368,7 @@ class Basecamp(object):
     
   def compute_joint(self):
     '''
-    Compute the model in a single step, allowing for a light curve-wide
+    Compute the model in a single step, allowing for an optional light curve-wide
     transit model. This is a bit more expensive to compute. 
     
     '''
@@ -646,6 +651,9 @@ class Basecamp(object):
   
   def search(self, pos_tol = 2.5, neg_tol = 50., clobber = False, name = 'search', **kwargs):
     '''
+    Computes the joint instrumental/transit model for a transit centered at each cadence in 
+    the light curve and returns the maximum likelihood depth, depth variance, and delta-chi
+    squared as a function of time.
     
     '''
     
@@ -673,3 +681,108 @@ class Basecamp(object):
       pl.close()
     
     return time, depth, vardepth, delchisq
+  
+  def overfit(self, tau = None):
+    '''
+    Returns the overfitting metric for the light curve.
+    
+    '''
+     
+    # debug
+    #tau = TransitShape(dur = 0.1)
+    #transit_model = 1 + 0.01 * tau(self.time, t0 = 2081.76)
+    #for i in range(self.fpix.shape[1]):
+    #  self.fpix[:,i] *= transit_model 
+    #self.fraw = np.nansum(self.fpix, axis = 1)
+    #self.get_norm()
+    #self.X1N = None
+    # /debug
+    
+    log.info("Computing the overfitting metric...")
+    A = [None for b in self.breakpoints]
+    B = [None for b in self.breakpoints]
+
+    # Loop over all chunks
+    for b, brkpt in enumerate(self.breakpoints):
+    
+      # Masks for current chunk
+      m = self.get_masked_chunk(b, pad = False)
+      c = self.get_chunk(b, pad = False)
+      
+      # The X^2 matrices
+      A[b] = np.zeros((len(m), len(m)))
+      B[b] = np.zeros((len(c), len(m)))
+      
+      # Loop over all orders
+      for n in range(self.pld_order):
+
+        # Only compute up to the current PLD order
+        if (self.lam_idx >= n) and (self.lam[b][n] is not None):
+          XM = self.X(n,m)
+          XC = self.X(n,c)
+          A[b] += self.lam[b][n] * np.dot(XM, XM.T)
+          B[b] += self.lam[b][n] * np.dot(XC, XM.T)
+          del XM, XC
+    
+    # Merge chunks. BIGA and BIGB are sparse, but unfortunately
+    # scipy.sparse doesn't handle sparse matrix inversion all that
+    # well when the *result* is not itself sparse. So we're sticking
+    # with regular np.linalg.
+    BIGA = block_diag(*A)
+    del A
+    BIGB = block_diag(*B)
+    del B
+    
+    # Compute the full covariance matrix
+    mK = GetCovariance(self.kernel, self.kernel_params, self.apply_mask(self.time), self.apply_mask(self.fraw_err))
+       
+    # The transit model
+    if tau is None:
+      tau = TransitShape(dur = 0.1)
+    
+    # The regression matrix
+    R = np.linalg.solve((mK + BIGA).T, BIGA.T).T
+    
+    # The full inverse
+    Kinv = np.linalg.inv(mK)
+
+    # The masked time array
+    time = self.apply_mask(self.time)
+    
+    # One minus the R matrix
+    IR = np.identity(len(time)) - R
+    
+    # Loop over all cadences
+    O = np.zeros_like(time)
+    for k in prange(len(time)):
+      
+      # Evaluate the transit model
+      T = tau(time, t0 = time[k])
+      i = np.where(T < 0)[0]
+      
+      # Compute the submatrices
+      T_ = T[i].reshape(-1,1)
+      
+      # Sparse algebra
+      A = np.dot(np.dot(T_.T, Kinv[i,:][:,i]), T_)
+      B = np.dot(T_.T, Kinv[i,:])
+      C = np.dot(IR[:,i], T_)
+      
+      # Compute the overfitting metric
+      O[k] = 1 - np.dot(B, C) / A
+    
+    # Re-compute model
+    self.model = np.dot(BIGB, np.linalg.solve(mK + BIGA, self.apply_mask(self.fraw - np.nanmedian(self.fraw))))
+    self.model -= np.nanmedian(self.model)
+    
+    # Plot
+    fig, ax = pl.subplots(2, sharex = True)
+    ax[0].plot(self.apply_mask(self.time), self.apply_mask(self.fraw), 'r.', alpha = 0.3, ms = 2)
+    ax[0].set_ylim(*ax[0].get_ylim())
+    ax[0].plot(self.time, self.flux, 'k.', alpha = 0.3, ms = 2, label = '%.3f' % self.get_cdpp())
+    ax[1].plot(time, O, 'b.', lw = 1, alpha = 0.5, ms = 2, label = '%.3f' % np.nanmedian(O))
+    ax[0].legend(loc = 'upper left')
+    ax[1].legend(loc = 'upper left')
+    pl.show()
+
+    return 

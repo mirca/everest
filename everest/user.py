@@ -1269,6 +1269,7 @@ class Everest(Basecamp):
       ylim = (lo - pad, hi + pad)
     ax.set_ylim(ylim)   
     
+    '''
     # Indicate off-axis outliers
     for i in np.where(flux < ylim[0])[0]:
       if i in bmask:
@@ -1286,7 +1287,8 @@ class Everest(Basecamp):
       ax.annotate('', xy=(time[i], ylim[1]), xycoords = 'data',
                   xytext = (0, -15), textcoords = 'offset points',
                   arrowprops=dict(arrowstyle = "-|>", color = color, alpha = 0.5))
-  
+    '''
+    
     if show:
       pl.show()
       pl.close()
