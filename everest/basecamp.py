@@ -11,7 +11,7 @@ inherit from :py:class:`Basecamp`.
 
 from __future__ import division, print_function, absolute_import, unicode_literals
 from . import missions
-from .utils import InitLog, Formatter, AP_SATURATED_PIXEL, AP_COLLAPSED_PIXEL
+from .utils import InitLog, Formatter, AP_SATURATED_PIXEL, AP_COLLAPSED_PIXEL, prange, Overfit
 from .math import Chunks, Scatter, SavGol, Interpolate
 from .gp import GetCovariance
 from .search import Search
@@ -26,11 +26,6 @@ from matplotlib.ticker import MaxNLocator, FuncFormatter
 from scipy.ndimage import zoom
 from itertools import combinations_with_replacement as multichoose
 import traceback
-try:
-  from tqdm import tqdm
-  prange = lambda x: tqdm(range(x))
-except ImportError:
-  prange = lambda x: range(x)
 import logging
 log = logging.getLogger(__name__)
 
@@ -264,7 +259,7 @@ class Basecamp(object):
     
     self._norm = self.fraw
   
-  def X(self, i, j = slice(None, None, None)):
+  def X(self, i, j = slice(None, None, None), neighbors = True):
     '''
     Computes the design matrix at the given *PLD* order and the given indices. 
     The columns are the *PLD* vectors for the target at the
@@ -276,7 +271,7 @@ class Basecamp(object):
 
     X1 = self.fpix[j] / self.norm[j].reshape(-1, 1)
     X = np.product(list(multichoose(X1.T, i + 1)), axis = 1).T
-    if self.X1N is not None:
+    if (self.X1N is not None) and neighbors:
       return np.hstack([X, self.X1N[j] ** (i + 1)])
     else:
       return X
@@ -682,26 +677,19 @@ class Basecamp(object):
     
     return time, depth, vardepth, delchisq
   
-  def overfit(self, tau = None):
+  def overfit(self, tau = None, plot = True):
     '''
     Returns the overfitting metric for the light curve.
     
     '''
-     
-    # debug
-    #tau = TransitShape(dur = 0.1)
-    #transit_model = 1 + 0.01 * tau(self.time, t0 = 2081.76)
-    #for i in range(self.fpix.shape[1]):
-    #  self.fpix[:,i] *= transit_model 
-    #self.fraw = np.nansum(self.fpix, axis = 1)
-    #self.get_norm()
-    #self.X1N = None
-    # /debug
     
     log.info("Computing the overfitting metric...")
     A = [None for b in self.breakpoints]
     B = [None for b in self.breakpoints]
-
+    
+    AnN = [None for b in self.breakpoints]
+    BnN = [None for b in self.breakpoints]
+    
     # Loop over all chunks
     for b, brkpt in enumerate(self.breakpoints):
     
@@ -712,6 +700,8 @@ class Basecamp(object):
       # The X^2 matrices
       A[b] = np.zeros((len(m), len(m)))
       B[b] = np.zeros((len(c), len(m)))
+      AnN[b] = np.zeros((len(m), len(m)))
+      BnN[b] = np.zeros((len(c), len(m)))
       
       # Loop over all orders
       for n in range(self.pld_order):
@@ -723,6 +713,12 @@ class Basecamp(object):
           A[b] += self.lam[b][n] * np.dot(XM, XM.T)
           B[b] += self.lam[b][n] * np.dot(XC, XM.T)
           del XM, XC
+          
+          XM = self.X(n,m,neighbors=False)
+          XC = self.X(n,c,neighbors=False)
+          AnN[b] += self.lam[b][n] * np.dot(XM, XM.T)
+          BnN[b] += self.lam[b][n] * np.dot(XC, XM.T)
+          del XM, XC
     
     # Merge chunks. BIGA and BIGB are sparse, but unfortunately
     # scipy.sparse doesn't handle sparse matrix inversion all that
@@ -732,6 +728,10 @@ class Basecamp(object):
     del A
     BIGB = block_diag(*B)
     del B
+    BIGAnN = block_diag(*AnN)
+    del AnN
+    BIGBnN = block_diag(*BnN)
+    del BnN
     
     # Compute the full covariance matrix
     mK = GetCovariance(self.kernel, self.kernel_params, self.apply_mask(self.time), self.apply_mask(self.fraw_err))
@@ -740,20 +740,27 @@ class Basecamp(object):
     if tau is None:
       tau = TransitShape(dur = 0.1)
     
+    log.info("Inverting a couple large matrices...")
+    
     # The regression matrix
     R = np.linalg.solve((mK + BIGA).T, BIGA.T).T
+    RnN = np.linalg.solve((mK + BIGAnN).T, BIGAnN.T).T
     
     # The full inverse
     Kinv = np.linalg.inv(mK)
-
+    
     # The masked time array
     time = self.apply_mask(self.time)
     
     # One minus the R matrix
     IR = np.identity(len(time)) - R
+    IRnN = np.identity(len(time)) - RnN
+    
+    log.info("Looping through the dataset...")
     
     # Loop over all cadences
     O = np.zeros_like(time)
+    OnN = np.zeros_like(time)
     for k in prange(len(time)):
       
       # Evaluate the transit model
@@ -767,22 +774,52 @@ class Basecamp(object):
       A = np.dot(np.dot(T_.T, Kinv[i,:][:,i]), T_)
       B = np.dot(T_.T, Kinv[i,:])
       C = np.dot(IR[:,i], T_)
+      CnN = np.dot(IRnN[:,i], T_)
       
       # Compute the overfitting metric
       O[k] = 1 - np.dot(B, C) / A
+      
+      # Compute the overfitting metric w/ no neighbors
+      OnN[k] = 1 - np.dot(B, CnN) / A
     
-    # Re-compute model
+    # The result
+    res = Overfit()
+    
+    # Compute model w/ no neighbors
+    self.model = np.dot(BIGBnN, np.linalg.solve(mK + BIGAnN, self.apply_mask(self.fraw - np.nanmedian(self.fraw))))
+    self.model -= np.nanmedian(self.model)
+    res.rPLDC = self.get_cdpp()
+    
+    # Compute model
     self.model = np.dot(BIGB, np.linalg.solve(mK + BIGA, self.apply_mask(self.fraw - np.nanmedian(self.fraw))))
     self.model -= np.nanmedian(self.model)
-    
-    # Plot
-    fig, ax = pl.subplots(2, sharex = True)
-    ax[0].plot(self.apply_mask(self.time), self.apply_mask(self.fraw), 'r.', alpha = 0.3, ms = 2)
-    ax[0].set_ylim(*ax[0].get_ylim())
-    ax[0].plot(self.time, self.flux, 'k.', alpha = 0.3, ms = 2, label = '%.3f' % self.get_cdpp())
-    ax[1].plot(time, O, 'b.', lw = 1, alpha = 0.5, ms = 2, label = '%.3f' % np.nanmedian(O))
-    ax[0].legend(loc = 'upper left')
-    ax[1].legend(loc = 'upper left')
-    pl.show()
+    res.nPLDC = self.get_cdpp()
 
-    return 
+    # Compute metrics
+    res.nPLD = np.nanmedian(O)
+    res.rPLD = np.nanmedian(OnN)
+    res.nPLD50 = len(np.where(O > 0.5)[0]) / len(time)
+    res.rPLD50 = len(np.where(OnN > 0.5)[0]) / len(time)
+
+    # Plot
+    if plot:
+    
+      # TODO!
+      fig, ax = pl.subplots(3, sharex = True, figsize = (9, 7))
+      ax[0].plot(self.apply_mask(self.time), self.apply_mask(self.fraw), 'r.', alpha = 0.3, ms = 2)
+      ax[0].set_ylim(*ax[0].get_ylim())
+      ax[0].plot(self.time, self.flux, 'k.', alpha = 0.3, ms = 2)
+      ax[1].plot(time, O, 'b.', lw = 1, alpha = 0.5, ms = 2)
+      ax[2].plot(time, OnN, 'b.', lw = 1, alpha = 0.5, ms = 2)
+      ax[2].set_ylim(*ax[1].get_ylim())
+    
+      ax[0].annotate('%.3f ppm / %.3f ppm' % (res.nPLDC, res.rPLDC), xy = (0.025, 0.95), ha = 'left', va = 'top', xycoords = 'axes fraction', fontsize = 10, color = 'k')
+      ax[1].annotate('Median: %.3f' % res.nPLD, xy = (0.025, 0.95), ha = 'left', va = 'top', xycoords = 'axes fraction', fontsize = 10, color = 'k')
+      ax[2].annotate('Median: %.3f' % res.rPLD, xy = (0.025, 0.95), ha = 'left', va = 'top', xycoords = 'axes fraction', fontsize = 10, color = 'k')
+      ax[0].set_ylabel('Flux', fontsize = 14)
+      ax[1].set_ylabel('Overfitting', fontsize = 14)
+      ax[2].set_ylabel('No Neighbors', fontsize = 14)
+    
+      pl.show()
+
+    return res
