@@ -273,7 +273,7 @@ class Basecamp(object):
     X = np.product(list(multichoose(X1.T, i + 1)), axis = 1).T
     if (self.X1N is not None) and neighbors:
       # DEBUG
-      if i == 0:
+      if i == 2:
         return np.hstack([X, self.X1N[j] ** (i + 1)])
       else:
         return X
