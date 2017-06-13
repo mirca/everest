@@ -29,6 +29,7 @@ if not __EVEREST_SETUP__:
   from . import basecamp
   from . import detrender
   from . import inject
+  from . import overfit
   from . import user
   
   

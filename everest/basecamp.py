@@ -11,11 +11,12 @@ inherit from :py:class:`Basecamp`.
 
 from __future__ import division, print_function, absolute_import, unicode_literals
 from . import missions
-from .utils import InitLog, Formatter, AP_SATURATED_PIXEL, AP_COLLAPSED_PIXEL, prange, Overfit
+from .utils import InitLog, Formatter, AP_SATURATED_PIXEL, AP_COLLAPSED_PIXEL, prange
 from .math import Chunks, Scatter, SavGol, Interpolate
 from .gp import GetCovariance
 from .search import Search
 from .transit import TransitModel, TransitShape
+from .overfit import Overfit
 from scipy.linalg import block_diag
 import os, sys
 import numpy as np
@@ -259,7 +260,7 @@ class Basecamp(object):
     
     self._norm = self.fraw
   
-  def X(self, i, j = slice(None, None, None), neighbors = True):
+  def X(self, i, j = slice(None, None, None), neighbors = True, **kwargs):
     '''
     Computes the design matrix at the given *PLD* order and the given indices. 
     The columns are the *PLD* vectors for the target at the
@@ -272,11 +273,7 @@ class Basecamp(object):
     X1 = self.fpix[j] / self.norm[j].reshape(-1, 1)
     X = np.product(list(multichoose(X1.T, i + 1)), axis = 1).T
     if (self.X1N is not None) and neighbors:
-      # DEBUG
-      if i == 2:
-        return np.hstack([X, self.X1N[j] ** (i + 1)])
-      else:
-        return X
+      return np.hstack([X, self.X1N[j] ** (i + 1)])
     else:
       return X
      
@@ -681,18 +678,23 @@ class Basecamp(object):
     
     return time, depth, vardepth, delchisq
   
-  def overfit(self, tau = None, plot = True):
+  def overfit(self, tau = None, plot = True, **kwargs):
     '''
-    Returns the overfitting metric for the light curve.
+    Returns the overfitting metrics for the light curve.
+    
+    NOTE: We are doing math on the _normalized_ light curve
+    here, meaning we re-scale the regularization matrix and
+    the covariance matrix for numerical stability. This needs
+    to be done _everywhere_ in the code eventually!
     
     '''
     
-    log.info("Computing the overfitting metric...")
-    A = [None for b in self.breakpoints]
-    B = [None for b in self.breakpoints]
-    
-    AnN = [None for b in self.breakpoints]
-    BnN = [None for b in self.breakpoints]
+    log.info("Computing some large matrices...")
+    XLX = [None for b in self.breakpoints]
+    XLmX = [None for b in self.breakpoints]
+    X = [None for b in self.breakpoints]
+    XL = [None for b in self.breakpoints]
+    med = np.nanmedian(self.fraw)
     
     # Loop over all chunks
     for b, brkpt in enumerate(self.breakpoints):
@@ -702,128 +704,45 @@ class Basecamp(object):
       c = self.get_chunk(b, pad = False)
       
       # The X^2 matrices
-      A[b] = np.zeros((len(m), len(m)))
-      B[b] = np.zeros((len(c), len(m)))
-      AnN[b] = np.zeros((len(m), len(m)))
-      BnN[b] = np.zeros((len(c), len(m)))
+      XLX[b] = np.zeros((len(c), len(c)))
+      XLmX[b] = np.zeros((len(c), len(m)))
       
       # Loop over all orders
       for n in range(self.pld_order):
 
         # Only compute up to the current PLD order
         if (self.lam_idx >= n) and (self.lam[b][n] is not None):
-          XM = self.X(n,m)
-          XC = self.X(n,c)
-          A[b] += self.lam[b][n] * np.dot(XM, XM.T)
-          B[b] += self.lam[b][n] * np.dot(XC, XM.T)
-          del XM, XC
-          
-          XM = self.X(n,m,neighbors=False)
-          XC = self.X(n,c,neighbors=False)
-          AnN[b] += self.lam[b][n] * np.dot(XM, XM.T)
-          BnN[b] += self.lam[b][n] * np.dot(XC, XM.T)
-          del XM, XC
+          XM = self.X(n,m,**kwargs)
+          X[b] = self.X(n,c,**kwargs)
+          XL[b] = (1 / med ** 2) * self.lam[b][n] * X[b]
+          XLX[b] += (1 / med ** 2) * self.lam[b][n] * np.dot(X[b], X[b].T)
+          XLmX[b] += (1 / med ** 2) * self.lam[b][n] * np.dot(X[b], XM.T)
+          del XM
     
-    # Merge chunks. BIGA and BIGB are sparse, but unfortunately
-    # scipy.sparse doesn't handle sparse matrix inversion all that
-    # well when the *result* is not itself sparse. So we're sticking
-    # with regular np.linalg.
-    BIGA = block_diag(*A)
-    del A
-    BIGB = block_diag(*B)
-    del B
-    BIGAnN = block_diag(*AnN)
-    del AnN
-    BIGBnN = block_diag(*BnN)
-    del BnN
-    
-    # Compute the full covariance matrix
-    mK = GetCovariance(self.kernel, self.kernel_params, self.apply_mask(self.time), self.apply_mask(self.fraw_err))
-       
-    # The transit model
-    if tau is None:
-      tau = TransitShape(dur = 0.1)
-    
-    log.info("Inverting a couple large matrices...")
-    
-    # The regression matrix
-    R = np.linalg.solve((mK + BIGA).T, BIGA.T).T
-    RnN = np.linalg.solve((mK + BIGAnN).T, BIGAnN.T).T
-    
-    # The full inverse
-    Kinv = np.linalg.inv(mK)
-    
-    # The masked time array
-    time = self.apply_mask(self.time)
-    
-    # One minus the R matrix
-    IR = np.identity(len(time)) - R
-    IRnN = np.identity(len(time)) - RnN
-    
-    log.info("Looping through the dataset...")
-    
-    # Loop over all cadences
-    O = np.zeros_like(time)
-    OnN = np.zeros_like(time)
-    for k in prange(len(time)):
-      
-      # Evaluate the transit model
-      T = tau(time, t0 = time[k])
-      i = np.where(T < 0)[0]
-      
-      # Compute the submatrices
-      T_ = T[i].reshape(-1,1)
-      
-      # Sparse algebra
-      A = np.dot(np.dot(T_.T, Kinv[i,:][:,i]), T_)
-      B = np.dot(T_.T, Kinv[i,:])
-      C = np.dot(IR[:,i], T_)
-      CnN = np.dot(IRnN[:,i], T_)
-      
-      # Compute the overfitting metric
-      O[k] = 1 - np.dot(B, C) / A
-      
-      # Compute the overfitting metric w/ no neighbors
-      OnN[k] = 1 - np.dot(B, CnN) / A
-    
-    # The result
-    res = Overfit()
-    
-    # Compute model w/ no neighbors
-    self.model = np.dot(BIGBnN, np.linalg.solve(mK + BIGAnN, self.apply_mask(self.fraw - np.nanmedian(self.fraw))))
-    self.model -= np.nanmedian(self.model)
-    res.rPLDC = self.get_cdpp()
-    
-    # Compute model
-    self.model = np.dot(BIGB, np.linalg.solve(mK + BIGA, self.apply_mask(self.fraw - np.nanmedian(self.fraw))))
-    self.model -= np.nanmedian(self.model)
-    res.nPLDC = self.get_cdpp()
+    # Merge chunks
+    X = block_diag(*X)
+    XL = block_diag(*XL)
+    XLX = block_diag(*XLX)
+    XLmX = block_diag(*XLmX)
 
-    # Compute metrics
-    res.nPLD = np.nanmedian(O)
-    res.rPLD = np.nanmedian(OnN)
-    res.nPLD50 = len(np.where(O > 0.5)[0]) / len(time)
-    res.rPLD50 = len(np.where(OnN > 0.5)[0]) / len(time)
+    # Compute the full astrophysical covariance matrix
+    log.info("Inverting the covariance...")
+    if self.kernel == 'Basic':
+      w, a, t = self.kernel_params
+      w /= med
+      a /= med
+      kernel_params = [w, a, t]
+    elif self.kernel == 'QuasiPeriodic':
+      w, a, g, p = self.kernel_params
+      w /= med
+      a /= med
+      kernel_params = [w, a, g, p]
+    K = GetCovariance(self.kernel, kernel_params, self.time, self.fraw_err / med)
+    Kinv = np.linalg.inv(K)
+    
+    # Compute the overfitting metrics
+    log.info("Computing the overfitting...")
+    overfit = Overfit(self.time, self.fraw / med - 1, X, XL, XLmX, XLX + K, Kinv, 
+                      mask = self.mask, tau = tau, **kwargs)
 
-    # Plot
-    if plot:
-    
-      # TODO!
-      fig, ax = pl.subplots(3, sharex = True, figsize = (9, 7))
-      ax[0].plot(self.apply_mask(self.time), self.apply_mask(self.fraw), 'r.', alpha = 0.3, ms = 2)
-      ax[0].set_ylim(*ax[0].get_ylim())
-      ax[0].plot(self.time, self.flux, 'k.', alpha = 0.3, ms = 2)
-      ax[1].plot(time, O, 'b.', lw = 1, alpha = 0.5, ms = 2)
-      ax[2].plot(time, OnN, 'b.', lw = 1, alpha = 0.5, ms = 2)
-      ax[2].set_ylim(*ax[1].get_ylim())
-    
-      ax[0].annotate('%.3f ppm / %.3f ppm' % (res.nPLDC, res.rPLDC), xy = (0.025, 0.95), ha = 'left', va = 'top', xycoords = 'axes fraction', fontsize = 10, color = 'k')
-      ax[1].annotate('Median: %.3f' % res.nPLD, xy = (0.025, 0.95), ha = 'left', va = 'top', xycoords = 'axes fraction', fontsize = 10, color = 'k')
-      ax[2].annotate('Median: %.3f' % res.rPLD, xy = (0.025, 0.95), ha = 'left', va = 'top', xycoords = 'axes fraction', fontsize = 10, color = 'k')
-      ax[0].set_ylabel('Flux', fontsize = 14)
-      ax[1].set_ylabel('Overfitting', fontsize = 14)
-      ax[2].set_ylabel('No Neighbors', fontsize = 14)
-    
-      pl.show()
-
-    return res
+    return overfit

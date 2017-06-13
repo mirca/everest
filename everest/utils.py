@@ -207,15 +207,7 @@ class Formatter(object):
   CDPP2F = FuncFormatter(lambda x, p : '%.2f' % x)
   #: Integer formatter for chunk number
   Chunk = FuncFormatter(lambda x, p : '%2d' % x)
-
-class Overfit(object):
-  '''
-  Generic overfitting metric class.
   
-  '''
-  
-  pass
-
 def prange(x):
   '''
   Progress bar range with `tqdm`

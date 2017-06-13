@@ -13,7 +13,6 @@ from .math import Chunks
 from scipy.optimize import fmin_l_bfgs_b
 from scipy.signal import savgol_filter
 import numpy as np
-np.random.seed(48151623)
 import george
 from george.kernels import WhiteKernel, Matern32Kernel, ExpSine2Kernel
 import logging
@@ -73,7 +72,8 @@ def GetKernelParams(time, flux, errors, kernel = 'Basic', mask = [], giter = 3, 
   :param tuple guess: The guess to initialize the minimization with. Default :py:obj:`None`
   
   '''
-
+  
+  np.random.seed(48151623)
   log.info("Optimizing the GP...")
   
   # Save a copy of time and errors for later
